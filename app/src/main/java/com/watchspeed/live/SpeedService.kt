@@ -11,7 +11,6 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.location.GnssStatus
-import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Build
@@ -24,7 +23,6 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.wear.ongoing.OngoingActivity
 import androidx.wear.ongoing.Status
-import com.google.android.gms.location.Granularity
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
@@ -44,11 +42,10 @@ class SpeedService : Service() {
     private lateinit var gpsExecutor: ExecutorService
 
     private val tracking = AtomicBoolean(false)
-    private val fusedStarted = AtomicBoolean(false)
+    private val phoneStarted = AtomicBoolean(false)
     private val receiverRegistered = AtomicBoolean(false)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastNotifyElapsed = 0L
-    private var lastGpsElapsedNanos = 0L
     private var lastWakeElapsed = 0L
 
     private val wakeLock by lazy {
@@ -58,10 +55,18 @@ class SpeedService : Service() {
     }
 
     private val gpsListener = LocationListener { location ->
-        lastGpsElapsedNanos = location.elapsedRealtimeNanos
-        SpeedHub.publish(location, "GPS")
+        SpeedHub.publish(location, FixSource.WATCH)
         touchWakeLock()
         maybeNotify()
+    }
+
+    private val phoneCallback = object : LocationCallback() {
+        override fun onLocationResult(result: LocationResult) {
+            val location = result.lastLocation ?: return
+            SpeedHub.publish(location, FixSource.PHONE)
+            touchWakeLock()
+            maybeNotify()
+        }
     }
 
     private val gnssCallback = object : GnssStatus.Callback() {
@@ -71,18 +76,6 @@ class SpeedService : Service() {
                 if (status.usedInFix(index)) used++
             }
             SpeedHub.setSatellites(used)
-        }
-    }
-
-    private val fusedCallback = object : LocationCallback() {
-        override fun onLocationResult(result: LocationResult) {
-            val location = result.lastLocation ?: return
-            val gpsAgeNanos = SystemClock.elapsedRealtimeNanos() - lastGpsElapsedNanos
-            val gpsIsFresh = lastGpsElapsedNanos != 0L && gpsAgeNanos < 2_000_000_000L
-            if (gpsIsFresh) return
-            SpeedHub.publish(location, "PHONE")
-            touchWakeLock()
-            maybeNotify()
         }
     }
 
@@ -106,6 +99,7 @@ class SpeedService : Service() {
         startAsForeground("Searching GPS")
         registerProviderReceiver()
         refreshTracking()
+        applyLocationMode()
         touchWakeLock()
         return START_NOT_STICKY
     }
@@ -121,9 +115,11 @@ class SpeedService : Service() {
     }
 
     private fun refreshTracking() {
-        val enabled = gpsProviderEnabled()
-        SpeedHub.setGpsEnabled(enabled)
-        if (enabled) startUpdates() else stopUpdates()
+        val watchGps = gpsProviderEnabled()
+        val canTrack = watchGps || SpeedHub.mode.value == LocationMode.BOTH
+        SpeedHub.setGpsEnabled(canTrack)
+        if (watchGps) startUpdates() else stopWatchUpdates()
+        applyLocationMode()
         maybeNotify(force = true)
     }
 
@@ -139,13 +135,28 @@ class SpeedService : Service() {
     private fun startUpdates() {
         if (!tracking.compareAndSet(false, true)) return
         try {
-            locationManager.requestLocationUpdates(
-                LocationManager.GPS_PROVIDER,
-                0L,
-                0f,
-                gpsExecutor,
-                gpsListener,
-            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val request = android.location.LocationRequest.Builder(GPS_INTERVAL_MS)
+                    .setQuality(android.location.LocationRequest.QUALITY_HIGH_ACCURACY)
+                    .setMinUpdateIntervalMillis(GPS_MIN_INTERVAL_MS)
+                    .setMaxUpdateDelayMillis(0L)
+                    .setMinUpdateDistanceMeters(0f)
+                    .build()
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER,
+                    request,
+                    gpsExecutor,
+                    gpsListener,
+                )
+            } else {
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER,
+                    GPS_MIN_INTERVAL_MS,
+                    0f,
+                    gpsExecutor,
+                    gpsListener,
+                )
+            }
         } catch (_: Exception) {
             tracking.set(false)
         }
@@ -154,30 +165,43 @@ class SpeedService : Service() {
         } catch (_: Exception) {
             // Satellite count is optional. Speed still works without it.
         }
-        startFusedUpdates()
     }
 
     @SuppressLint("MissingPermission")
-    private fun startFusedUpdates() {
-        if (!fusedStarted.compareAndSet(false, true)) return
-        try {
-            val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 100L)
-                .setMinUpdateIntervalMillis(0L)
-                .setMinUpdateDistanceMeters(0f)
-                .setMaxUpdateDelayMillis(0L)
-                .setWaitForAccurateLocation(false)
-                .setGranularity(Granularity.GRANULARITY_FINE)
-                .build()
-            LocationServices.getFusedLocationProviderClient(this)
-                .requestLocationUpdates(request, fusedCallback, Looper.getMainLooper())
-        } catch (_: Exception) {
-            fusedStarted.set(false)
+    private fun applyLocationMode() {
+        if (SpeedHub.mode.value == LocationMode.BOTH) {
+            startPhoneUpdates()
+        } else {
+            stopPhoneUpdates()
         }
     }
 
-    private fun stopUpdates() {
+    @SuppressLint("MissingPermission")
+    private fun startPhoneUpdates() {
+        if (!phoneStarted.compareAndSet(false, true)) return
+        try {
+            val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, GPS_INTERVAL_MS)
+                .setMinUpdateIntervalMillis(GPS_MIN_INTERVAL_MS)
+                .setMaxUpdateDelayMillis(0L)
+                .setWaitForAccurateLocation(false)
+                .build()
+            LocationServices.getFusedLocationProviderClient(this)
+                .requestLocationUpdates(request, phoneCallback, Looper.getMainLooper())
+        } catch (_: Exception) {
+            phoneStarted.set(false)
+        }
+    }
+
+    private fun stopPhoneUpdates() {
+        if (!phoneStarted.compareAndSet(true, false)) return
+        try {
+            LocationServices.getFusedLocationProviderClient(this).removeLocationUpdates(phoneCallback)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun stopWatchUpdates() {
         tracking.set(false)
-        lastGpsElapsedNanos = 0L
         try {
             locationManager.removeUpdates(gpsListener)
         } catch (_: Exception) {
@@ -186,13 +210,11 @@ class SpeedService : Service() {
             locationManager.unregisterGnssStatusCallback(gnssCallback)
         } catch (_: Exception) {
         }
-        if (fusedStarted.compareAndSet(true, false)) {
-            try {
-                LocationServices.getFusedLocationProviderClient(this)
-                    .removeLocationUpdates(fusedCallback)
-            } catch (_: Exception) {
-            }
-        }
+    }
+
+    private fun stopUpdates() {
+        stopWatchUpdates()
+        stopPhoneUpdates()
     }
 
     private fun touchWakeLock() {
@@ -248,8 +270,8 @@ class SpeedService : Service() {
         val sample = SpeedHub.sample.value
         if (!SpeedHub.gpsEnabled.value) return "Location off"
         if (!sample.hasFix || sample.metersPerSecond == null) return "Searching GPS"
-        val speed = SpeedFormat.format(sample.metersPerSecond, SpeedHub.useMph.value)
-        return "$speed ${SpeedFormat.unit(SpeedHub.useMph.value)}"
+        val speed = SpeedFormat.format(sample.metersPerSecond)
+        return "$speed ${SpeedFormat.unit()}"
     }
 
     private fun startAsForeground(text: String) {
@@ -308,9 +330,12 @@ class SpeedService : Service() {
         return builder.build()
     }
 
-    private companion object {
-        const val CHANNEL_ID = "live_speed"
+    companion object {
+        const val ACTION_APPLY_MODE = "com.watchspeed.live.APPLY_MODE"
+        private const val CHANNEL_ID = "live_speed"
         const val NOTIFICATION_ID = 42
+        const val GPS_INTERVAL_MS = 200L
+        const val GPS_MIN_INTERVAL_MS = 100L
         const val NOTIFY_INTERVAL_MS = 1_000L
         const val WAKE_HOLD_MS = 60L * 60L * 1_000L
         const val WAKE_RENEW_MS = 10L * 60L * 1_000L

@@ -79,8 +79,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         lifecycle.addObserver(AmbientLifecycleObserver(this, ambientCallback))
-        SpeedHub.useMph.value = getSharedPreferences(PREFS, MODE_PRIVATE)
-            .getBoolean(KEY_MPH, false)
+        SpeedHub.mode.value = savedLocationMode()
         hasPermission.value = locationGranted()
         if (hasPermission.value) startSpeedService()
 
@@ -93,7 +92,7 @@ class MainActivity : ComponentActivity() {
                 hasPermission = hasPermission.value,
                 onRequestPermission = ::requestLocationPermission,
                 onOpenLocationSettings = ::openLocationSettings,
-                onToggleUnit = ::toggleUnit,
+                onCycleLocationMode = ::cycleLocationMode,
             )
         }
     }
@@ -134,12 +133,6 @@ class MainActivity : ComponentActivity() {
         permissionLauncher.launch(permissions.toTypedArray())
     }
 
-    private fun toggleUnit() {
-        val next = !SpeedHub.useMph.value
-        SpeedHub.useMph.value = next
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_MPH, next).apply()
-    }
-
     private fun locationGranted(): Boolean {
         return ContextCompat.checkSelfPermission(
             this,
@@ -147,8 +140,25 @@ class MainActivity : ComponentActivity() {
         ) == PackageManager.PERMISSION_GRANTED
     }
 
-    private fun startSpeedService() {
-        ContextCompat.startForegroundService(this, Intent(this, SpeedService::class.java))
+    private fun cycleLocationMode() {
+        val next = when (SpeedHub.mode.value) {
+            LocationMode.WATCH -> LocationMode.BOTH
+            LocationMode.BOTH -> LocationMode.WATCH
+        }
+        SpeedHub.mode.value = next
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_MODE, next.name).apply()
+        startSpeedService(SpeedService.ACTION_APPLY_MODE)
+    }
+
+    private fun savedLocationMode(): LocationMode {
+        val saved = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_MODE, null)
+        return runCatching { LocationMode.valueOf(saved ?: "") }.getOrDefault(LocationMode.WATCH)
+    }
+
+    private fun startSpeedService(action: String? = null) {
+        val intent = Intent(this, SpeedService::class.java)
+        if (action != null) intent.action = action
+        ContextCompat.startForegroundService(this, intent)
     }
 
     private fun openLocationSettings() {
@@ -172,7 +182,7 @@ class MainActivity : ComponentActivity() {
     /**
      * Ambient mode normally repaints about once a minute. A one-second alarm
      * wakes the watch often enough to push the latest GPS speed onto the
-     * always-on screen. The GPS chip itself still reports about once a second.
+     * always-on screen. While the screen is on, each GPS fix is drawn as it arrives.
      */
     private fun scheduleAmbientRefresh() {
         if (!isAmbient.value) return
@@ -213,7 +223,7 @@ class MainActivity : ComponentActivity() {
         const val ACTION_AMBIENT_TICK = "com.watchspeed.live.AMBIENT_TICK"
         const val AMBIENT_REFRESH_MS = 1_000L
         const val PREFS = "speed"
-        const val KEY_MPH = "use_mph"
         const val KEY_ASKED = "asked_location"
+        const val KEY_MODE = "location_mode"
     }
 }

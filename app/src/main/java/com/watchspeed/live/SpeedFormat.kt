@@ -1,19 +1,25 @@
 package com.watchspeed.live
 
 import java.util.Locale
+import kotlin.math.roundToInt
 
 object SpeedFormat {
-    fun format(metersPerSecond: Float?, useMph: Boolean): String {
-        if (metersPerSecond == null || metersPerSecond.isNaN()) return PLACEHOLDER
-        val value = if (useMph) metersPerSecond * MPH_PER_MPS else metersPerSecond * KMH_PER_MPS
-        return String.format(Locale.US, "%.1f", value)
+    fun format(metersPerSecond: Float?): String {
+        val rounded = rounded(metersPerSecond) ?: return PLACEHOLDER
+        return rounded.toString()
     }
 
-    fun unit(useMph: Boolean): String = if (useMph) "mph" else "km/h"
+    private fun rounded(metersPerSecond: Float?): Int? {
+        if (metersPerSecond == null || metersPerSecond.isNaN() || metersPerSecond.isInfinite()) {
+            return null
+        }
+        return (metersPerSecond * KMH_PER_MPS).roundToInt().coerceAtLeast(0)
+    }
+
+    fun unit(): String = "km/h"
 
     fun age(ageMs: Long): String = String.format(Locale.US, "%.1fs", ageMs / 1000.0)
 
     private const val KMH_PER_MPS = 3.6f
-    private const val MPH_PER_MPS = 2.2369363f
-    private const val PLACEHOLDER = "--.-"
+    private const val PLACEHOLDER = "--"
 }

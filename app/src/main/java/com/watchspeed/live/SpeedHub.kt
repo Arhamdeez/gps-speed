@@ -1,7 +1,32 @@
 package com.watchspeed.live
 
 import android.location.Location
+import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableStateFlow
+
+enum class LocationMode {
+    WATCH,
+    BOTH,
+}
+
+enum class FixSource {
+    WATCH,
+    PHONE,
+}
+
+fun LocationMode.title(): String = when (this) {
+    LocationMode.WATCH -> "Watch only"
+    LocationMode.BOTH -> "Watch + phone"
+}
+
+/** Phone fixes are used only while watch GPS has gone quiet, so the two cannot flicker. */
+internal fun shouldUsePhoneFix(mode: LocationMode, watchAgeNanos: Long?): Boolean {
+    if (mode != LocationMode.BOTH) return false
+    val age = watchAgeNanos ?: return true
+    return age > PHONE_AFTER_WATCH_NANOS
+}
+
+private const val PHONE_AFTER_WATCH_NANOS = 2_500_000_000L
 
 data class SpeedSample(
     val metersPerSecond: Float? = null,
@@ -10,6 +35,7 @@ data class SpeedSample(
     val hasFix: Boolean = false,
     val satellitesUsed: Int = 0,
     val sourceLabel: String = "GPS",
+    val trend: SpeedTrend = SpeedTrend.STEADY,
 )
 
 /**
@@ -19,23 +45,22 @@ data class SpeedSample(
 object SpeedHub {
     val sample = MutableStateFlow(SpeedSample())
     val gpsEnabled = MutableStateFlow(true)
-    val useMph = MutableStateFlow(false)
+    val mode = MutableStateFlow(LocationMode.WATCH)
 
-    private var lastLocation: Location? = null
+    private val filter = SpeedFilter()
+    private val trendTracker = SpeedTrendTracker()
     private var satellites = 0
-    private var holdingZero = false
+    private var lastWatchSpeedRealtimeNanos = 0L
 
     @Synchronized
     fun setGpsEnabled(enabled: Boolean) {
         gpsEnabled.value = enabled
         if (!enabled) {
-            holdingZero = false
-            lastLocation = null
-            sample.value = sample.value.copy(
-                hasFix = false,
-                metersPerSecond = null,
-                satellitesUsed = 0,
-            )
+            filter.reset()
+            trendTracker.reset()
+            satellites = 0
+            lastWatchSpeedRealtimeNanos = 0L
+            sample.value = SpeedSample()
         }
     }
 
@@ -46,43 +71,41 @@ object SpeedHub {
     }
 
     @Synchronized
-    fun publish(location: Location, sourceLabel: String) {
-        val shown = applyStillness(rawSpeed(location))
-        lastLocation = location
+    fun publish(location: Location, source: FixSource) {
+        val watchAge = if (lastWatchSpeedRealtimeNanos == 0L) {
+            null
+        } else {
+            SystemClock.elapsedRealtimeNanos() - lastWatchSpeedRealtimeNanos
+        }
+        if (source == FixSource.PHONE && !shouldUsePhoneFix(mode.value, watchAge)) return
+
+        val hasDopplerSpeed = location.hasSpeed() && !location.speed.isNaN()
+        if (source == FixSource.WATCH && hasDopplerSpeed) {
+            lastWatchSpeedRealtimeNanos = location.elapsedRealtimeNanos
+        }
+        val speed = if (hasDopplerSpeed) location.speed else null
+        val speedAccuracy = if (location.hasSpeedAccuracy()) {
+            location.speedAccuracyMetersPerSecond
+        } else {
+            null
+        }
+        val horizontalAccuracy = if (location.hasAccuracy()) location.accuracy else null
+        val timeMillis = location.elapsedRealtimeNanos / 1_000_000L
+        val filtered = filter.update(
+            timeMillis = timeMillis,
+            speedMps = speed,
+            speedAccuracyMps = speedAccuracy,
+            horizontalAccuracyMeters = horizontalAccuracy,
+        )
+        val trend = trendTracker.update(timeMillis, filtered)
         sample.value = SpeedSample(
-            metersPerSecond = shown,
-            accuracyMeters = if (location.hasAccuracy()) location.accuracy else null,
+            metersPerSecond = filtered,
+            accuracyMeters = horizontalAccuracy,
             elapsedRealtimeNanos = location.elapsedRealtimeNanos,
-            hasFix = shown != null,
+            hasFix = filtered != null,
             satellitesUsed = satellites,
-            sourceLabel = sourceLabel,
+            sourceLabel = if (source == FixSource.PHONE) "Phone" else "Watch",
+            trend = trend,
         )
     }
-
-    private fun rawSpeed(location: Location): Float? {
-        if (location.hasSpeed() && location.speed >= 0f && !location.speed.isNaN()) {
-            return location.speed
-        }
-        val previous = lastLocation ?: return null
-        val elapsedSeconds = (location.time - previous.time) / 1000f
-        if (elapsedSeconds < 0.05f || elapsedSeconds > 15f) return null
-        return previous.distanceTo(location) / elapsedSeconds
-    }
-
-    /**
-     * GPS jitters by about 1 km/h when you are standing still.
-     * Hold 0 until the fix clearly starts moving, then release.
-     */
-    private fun applyStillness(raw: Float?): Float? {
-        raw ?: return null
-        if (holdingZero) {
-            if (raw >= STILL_EXIT_MPS) holdingZero = false
-        } else if (raw <= STILL_ENTER_MPS) {
-            holdingZero = true
-        }
-        return if (holdingZero) 0f else raw
-    }
-
-    private const val STILL_ENTER_MPS = 0.35f
-    private const val STILL_EXIT_MPS = 0.6f
 }

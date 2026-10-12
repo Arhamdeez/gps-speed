@@ -6,23 +6,23 @@ import org.junit.Test
 class SpeedFormatTest {
     @Test
     fun formatsKilometersPerHour() {
-        assertEquals("18.0", SpeedFormat.format(5f, useMph = false))
-        assertEquals("0.0", SpeedFormat.format(0f, useMph = false))
+        assertEquals("18", SpeedFormat.format(5f))
+        assertEquals("0", SpeedFormat.format(0f))
     }
 
     @Test
-    fun formatsMilesPerHour() {
-        assertEquals("11.2", SpeedFormat.format(5f, useMph = true))
+    fun roundsToTheNearestWholeNumber() {
+        assertEquals("18", SpeedFormat.format(5.1f))
+        assertEquals("19", SpeedFormat.format(5.2f))
     }
 
     @Test
     fun missingFixIsAPlaceholder() {
-        assertEquals("--.-", SpeedFormat.format(null, useMph = false))
+        assertEquals("--", SpeedFormat.format(null))
     }
 
     @Test
-    fun unitLabelFollowsTheToggle() {
-        assertEquals("km/h", SpeedFormat.unit(useMph = false))
-        assertEquals("mph", SpeedFormat.unit(useMph = true))
+    fun unitIsKilometersPerHour() {
+        assertEquals("km/h", SpeedFormat.unit())
     }
 }

@@ -31,6 +31,34 @@ class SpeedFilterTest {
     }
 
     @Test
+    fun deskNoiseStaysAtZero() {
+        val filter = SpeedFilter()
+        val noise = floatArrayOf(0.2f, 1.8f, 0.4f, 2.8f, 0.3f, 2.2f, 1.0f, 3.0f, 0.5f)
+        noise.forEachIndexed { index, speed ->
+            val shown = filter.update(index * 1000L, speed, 0.8f, 12f)
+            assertEquals(0f, shown)
+        }
+    }
+
+    @Test
+    fun clearSpeedShowsImmediately() {
+        val filter = SpeedFilter()
+        assertEquals(0f, filter.update(0L, 6f, 0.4f, 8f))
+        val shown = filter.update(1_000L, 6f, 0.4f, 8f)
+        assertNear(6f, shown)
+    }
+
+    @Test
+    fun randomSpikesWhileStillStayAtZero() {
+        val filter = SpeedFilter()
+        val noise = floatArrayOf(0.4f, 6f, 0.2f, 11f, 1f, 4.5f, 0.3f, 9f, 0.5f, 15f)
+        noise.forEachIndexed { index, speed ->
+            val shown = filter.update(index * 200L, speed, 1.2f, 15f)
+            assertEquals(0f, shown)
+        }
+    }
+
+    @Test
     fun noisyLowSpeedStaysAtZero() {
         val filter = SpeedFilter()
         val noise = floatArrayOf(0.2f, 0.8f, 0.3f, 1.1f, 0.4f, 0.6f, 0.2f)
@@ -44,7 +72,7 @@ class SpeedFilterTest {
     fun realAccelerationShowsOnTheSameFix() {
         val filter = SpeedFilter()
         val ramp = floatArrayOf(0f, 3f, 6f, 9f, 12f, 12f)
-        val expected = floatArrayOf(0f, 3f, 6f, 9f, 12f, 12f)
+        val expected = floatArrayOf(0f, 0f, 6f, 9f, 12f, 12f)
         ramp.forEachIndexed { index, speed ->
             val shown = filter.update(index * 1000L, speed, 0.4f, 8f)
             assertNear(expected[index], shown)
@@ -63,7 +91,8 @@ class SpeedFilterTest {
     fun subSecondFixesUpdateImmediately() {
         val filter = SpeedFilter()
         filter.update(0L, 10f, 0.3f, 5f)
-        val shown = filter.update(200L, 12f, 0.3f, 5f)
+        filter.update(1_000L, 10f, 0.3f, 5f)
+        val shown = filter.update(1_200L, 12f, 0.3f, 5f)
         assertNear(12f, shown)
     }
 
@@ -83,11 +112,36 @@ class SpeedFilterTest {
     fun plausibleChangesMatchTheLatestSpeed() {
         val filter = SpeedFilter()
         val samples = floatArrayOf(4f, 7f, 3.5f, 8f, 5f, 9f, 4.5f, 6f, 22f, 5f)
-        val expected = floatArrayOf(4f, 7f, 3.5f, 8f, 5f, 9f, 4.5f, 6f, 6f, 5f)
+        val expected = floatArrayOf(0f, 7f, 3.5f, 8f, 5f, 9f, 4.5f, 6f, 6f, 5f)
         samples.forEachIndexed { index, speed ->
             val shown = filter.update(index * 1000L, speed, 0.5f, 8f)
             assertNear(expected[index], shown)
         }
+    }
+
+    @Test
+    fun uncertainSpeedWhileStoppedStaysAtZero() {
+        val filter = SpeedFilter()
+        assertEquals(0f, filter.update(0L, 4.2f, 6f, 25f))
+        assertEquals(0f, filter.update(1_200L, 4.5f, 6f, 25f))
+    }
+
+    @Test
+    fun steadySpeedAboveItsErrorBarShows() {
+        val filter = SpeedFilter()
+        assertEquals(0f, filter.update(0L, 4f, 0.6f, 8f))
+        assertNear(4.2f, filter.update(1_000L, 4.2f, 0.6f, 8f))
+    }
+
+    @Test
+    fun oneLowBlipWhileMovingDoesNotDropToZero() {
+        val filter = SpeedFilter()
+        filter.update(0L, 8f, 0.4f, 8f)
+        filter.update(1_000L, 8f, 0.4f, 8f)
+        val dipped = filter.update(2_000L, 0.4f, 0.4f, 8f)
+        val stopped = filter.update(3_000L, 0.3f, 0.4f, 8f)
+        assertNear(0.4f, dipped)
+        assertEquals(0f, stopped)
     }
 
     @Test

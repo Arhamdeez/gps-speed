@@ -13,6 +13,9 @@ class SpeedFilter {
     private var lastAdmitMs = Long.MIN_VALUE
     private var output: Float? = null
     private var holdingZero = true
+    private var movingSinceMs = Long.MIN_VALUE
+    private var fastSinceMs = Long.MIN_VALUE
+    private var stoppedSinceMs = Long.MIN_VALUE
 
     fun reset() {
         lastAccepted = null
@@ -20,6 +23,9 @@ class SpeedFilter {
         lastAdmitMs = Long.MIN_VALUE
         output = null
         holdingZero = true
+        movingSinceMs = Long.MIN_VALUE
+        fastSinceMs = Long.MIN_VALUE
+        stoppedSinceMs = Long.MIN_VALUE
     }
 
     fun update(
@@ -43,7 +49,7 @@ class SpeedFilter {
         val accepted = accept(timeMillis, speed) ?: return output
         lastAccepted = accepted
         lastAdmitMs = timeMillis
-        output = clampStill(accepted)
+        output = clampStill(timeMillis, accepted, speedAccuracyMps)
         return output
     }
 
@@ -71,6 +77,8 @@ class SpeedFilter {
     /**
      * Doppler speed accuracy is the quality signal. Position error is used
      * only when the chip did not report how sure it is about speed.
+     * A wide error bar still carries the best speed estimate, so only a
+     * reading the chip itself does not trust is dropped.
      */
     private fun trustworthy(speedAccuracyMps: Float?, horizontalAccuracyMeters: Float?): Boolean {
         if (speedAccuracyMps != null) {
@@ -81,11 +89,45 @@ class SpeedFilter {
         return horizontalAccuracyMeters == null || horizontalAccuracyMeters <= MAX_HORIZONTAL_M
     }
 
-    private fun clampStill(speed: Float): Float {
+    /**
+     * A still watch reports Doppler noise as random km/h. One spike, however
+     * high, stays at zero. Speed has to hold above the noise, and sit outside
+     * its own error bar, before it is shown. Once it does, each new fix shows
+     * at once, and one low sample does not snap the reading back to zero.
+     */
+    private fun clampStill(timeMillis: Long, speed: Float, accuracy: Float?): Float {
+        val aboveNoise = speed >= STILL_EXIT_MPS && (accuracy == null || speed > accuracy)
         if (holdingZero) {
-            if (speed >= STILL_EXIT_MPS) holdingZero = false
+            stoppedSinceMs = Long.MIN_VALUE
+            if (speed >= FAST_EXIT_MPS && aboveNoise) {
+                if (fastSinceMs == Long.MIN_VALUE) fastSinceMs = timeMillis
+            } else {
+                fastSinceMs = Long.MIN_VALUE
+            }
+            if (aboveNoise) {
+                if (movingSinceMs == Long.MIN_VALUE) movingSinceMs = timeMillis
+                val held = timeMillis - movingSinceMs
+                val fastHeld = if (fastSinceMs == Long.MIN_VALUE) 0L else timeMillis - fastSinceMs
+                if (held >= CONFIRM_MS || fastHeld >= MIN_FAST_MS) {
+                    holdingZero = false
+                    movingSinceMs = Long.MIN_VALUE
+                    fastSinceMs = Long.MIN_VALUE
+                }
+            } else {
+                movingSinceMs = Long.MIN_VALUE
+                fastSinceMs = Long.MIN_VALUE
+            }
         } else if (speed <= STILL_ENTER_MPS) {
-            holdingZero = true
+            movingSinceMs = Long.MIN_VALUE
+            if (stoppedSinceMs == Long.MIN_VALUE) {
+                stoppedSinceMs = timeMillis
+            } else if (timeMillis - stoppedSinceMs >= CONFIRM_MS) {
+                holdingZero = true
+                stoppedSinceMs = Long.MIN_VALUE
+            }
+        } else {
+            movingSinceMs = Long.MIN_VALUE
+            stoppedSinceMs = Long.MIN_VALUE
         }
         return if (holdingZero) 0f else speed
     }
@@ -97,9 +139,12 @@ class SpeedFilter {
         const val MAX_ACCEL_MPS2 = 14f
         const val AGREE_MPS = 2.5f
         const val MAX_HORIZONTAL_M = 40f
-        const val MAX_SPEED_ACCURACY_MPS = 4f
+        const val MAX_SPEED_ACCURACY_MPS = 10f
         const val MAX_SPEED_MPS = 120f
-        const val STILL_ENTER_MPS = 0.5f
-        const val STILL_EXIT_MPS = 1.25f
+        const val STILL_ENTER_MPS = 1.2f
+        const val STILL_EXIT_MPS = 2.5f
+        const val FAST_EXIT_MPS = 8f
+        const val MIN_FAST_MS = 200L
+        const val CONFIRM_MS = 1_000L
     }
 }

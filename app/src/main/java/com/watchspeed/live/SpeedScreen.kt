@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.BasicText
@@ -40,8 +42,10 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
-import kotlinx.coroutines.delay
+import kotlin.math.min
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 
 private val ScreenBlack = Color(0xFF000000)
 private val AmbientInk = Color(0xFFD0D0D0)
@@ -51,6 +55,7 @@ private val WeakSpeed = Color(0xFFFFC14D)
 private val EmptySpeed = Color(0xFF4A4A4A)
 private val BrakeRed = Color(0xFFFF3B30)
 private val AccelCool = Color(0xFF2EE0FF)
+private val HeartPink = Color(0xFFFF8FA3)
 
 @Composable
 fun SpeedScreen(
@@ -62,20 +67,20 @@ fun SpeedScreen(
     onRequestPermission: () -> Unit,
     onOpenLocationSettings: () -> Unit,
     onCycleLocationMode: () -> Unit,
+    heartAllowed: Boolean,
+    onOpenHeart: () -> Unit,
+    onRequestHeart: () -> Unit,
 ) {
     val context = LocalContext.current
-    var modeAnnouncement by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(modeAnnouncement) {
-        if (modeAnnouncement != null) {
-            delay(1_700)
-            modeAnnouncement = null
-        }
+    val mode by SpeedHub.mode.collectAsStateWithLifecycle()
+    val speedPeak by RideStore.currentSpeedPeak.collectAsStateWithLifecycle()
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) { RideStore.warm(context) }
     }
     val switchMode = remember(context, onCycleLocationMode) {
         {
             strongSwitchHaptic(context)
             onCycleLocationMode()
-            modeAnnouncement = SpeedHub.mode.value.title()
         }
     }
     val holdToSwitch = Modifier.pointerInput(switchMode) {
@@ -86,7 +91,7 @@ fun SpeedScreen(
         PromptScreen(
             title = "Speed needs GPS",
             action = "Tap to allow location",
-            note = modeAnnouncement,
+            note = mode.title(),
             onClick = onRequestPermission,
             onHold = switchMode,
         )
@@ -98,7 +103,7 @@ fun SpeedScreen(
         PromptScreen(
             title = "Location is off",
             action = "Tap to turn on GPS",
-            note = modeAnnouncement,
+            note = mode.title(),
             onClick = onOpenLocationSettings,
             onHold = switchMode,
         )
@@ -106,7 +111,7 @@ fun SpeedScreen(
     }
 
     val sample by SpeedHub.sample.collectAsStateWithLifecycle()
-    val mode by SpeedHub.mode.collectAsStateWithLifecycle()
+    val heart by HeartHub.reading.collectAsStateWithLifecycle()
     var frameClock by remember { mutableLongStateOf(SystemClock.elapsedRealtimeNanos()) }
     if (!isAmbient) {
         LaunchedEffect(Unit) {
@@ -115,6 +120,7 @@ fun SpeedScreen(
             }
         }
     }
+    val nowElapsedMs = if (isAmbient) SystemClock.elapsedRealtime() else frameClock / 1_000_000L
     val nowNanos = if (isAmbient) SystemClock.elapsedRealtimeNanos() else frameClock
     val ageMs = if (!sample.hasFix || sample.elapsedRealtimeNanos == 0L) {
         -1L
@@ -138,86 +144,191 @@ fun SpeedScreen(
         weak -> WeakSpeed
         else -> Color.White
     }
-    val unitColor = when {
-        isAmbient -> if (lowBitAmbient) Color.White else Muted
-        trendColor != null && speedText != "--" -> trendColor
-        else -> LiveUnit
+    val heartLabel = when {
+        !heartAllowed -> "Allow HR"
+        else -> {
+            val bpm = heart.freshBpm(nowElapsedMs)
+            if (bpm == null) "-- bpm" else "$bpm bpm"
+        }
     }
+    val heartColor = when {
+        isAmbient && lowBitAmbient -> Color.White
+        isAmbient -> AmbientInk
+        else -> HeartPink
+    }
+    var numberOnly by remember { mutableStateOf(false) }
 
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .background(ScreenBlack)
-            .then(holdToSwitch),
+            .background(ScreenBlack),
     ) {
         val shiftX = if (isAmbient && burnInProtection) ((ambientTick % 3) - 1) * 6 else 0
         val shiftY = if (isAmbient && burnInProtection) (((ambientTick / 3) % 3) - 1) * 6 else 0
-        val speedSize = maxWidth.value * when (speedText.length) {
-            1, 2 -> 0.48f
-            3 -> 0.39f
-            else -> 0.30f
-        }
-        val drift = Modifier.offset(x = shiftX.dp, y = shiftY.dp)
+        val boardHeight = maxHeight
+        val boardWidth = maxWidth
 
-        BasicText(
-            text = clockText(),
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = maxHeight * 0.15f)
-                .then(drift),
-            style = textStyle(
-                size = 14f,
-                color = if (lowBitAmbient && isAmbient) Color.White else Muted,
-                weight = FontWeight.Medium,
-                letterSpacing = 0.08.em,
-            ),
-        )
+        if (numberOnly) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .offset(x = shiftX.dp, y = shiftY.dp)
+                    .pointerInput(switchMode) {
+                        detectTapGestures(
+                            onDoubleTap = { numberOnly = false },
+                            onLongPress = { switchMode() },
+                        )
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                val speedSize = min(boardWidth.value, boardHeight.value) * when (speedText.length) {
+                    1 -> 0.68f
+                    2 -> 0.54f
+                    3 -> 0.40f
+                    else -> 0.30f
+                }
+                BasicText(
+                    text = speedText,
+                    maxLines = 1,
+                    softWrap = false,
+                    style = textStyle(
+                        size = speedSize,
+                        color = numberColor,
+                        weight = FontWeight.Bold,
+                        letterSpacing = (-0.04).em,
+                    ).copy(lineHeight = (speedSize * 1.05f).sp),
+                )
+            }
+            return@BoxWithConstraints
+        }
 
         Column(
             modifier = Modifier
-                .align(Alignment.Center)
-                .offset(x = shiftX.dp, y = shiftY.dp - maxHeight * 0.03f),
+                .fillMaxSize()
+                .padding(top = boardHeight * 0.12f, bottom = boardHeight * 0.16f)
+                .offset(x = shiftX.dp, y = shiftY.dp)
+                .then(holdToSwitch),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            BasicText(
-                text = speedText,
-                maxLines = 1,
-                softWrap = false,
-                style = textStyle(
-                    size = speedSize,
-                    color = numberColor,
-                    weight = FontWeight.Bold,
-                    letterSpacing = (-0.04).em,
-                ),
-            )
-            BasicText(
-                text = SpeedFormat.unit(),
-                modifier = Modifier.padding(top = 2.dp),
-                style = textStyle(
-                    size = 15f,
-                    color = unitColor,
-                    weight = FontWeight.SemiBold,
-                    letterSpacing = 0.12.em,
-                ),
-            )
-        }
-
-        if (!isAmbient || modeAnnouncement != null) {
-            BasicText(
-                text = modeAnnouncement ?: statusText(sample, mode, ageMs, stale, waiting, weak),
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                BasicText(
+                    text = clockText(),
+                    style = textStyle(
+                        size = 13f,
+                        color = if (lowBitAmbient && isAmbient) Color.White else Muted,
+                        weight = FontWeight.Medium,
+                        letterSpacing = 0.08.em,
+                    ),
+                )
+                BasicText(
+                    text = heartLabel,
+                    modifier = Modifier
+                        .padding(top = 2.dp)
+                        .then(
+                            if (isAmbient) {
+                                Modifier
+                            } else {
+                                Modifier.pointerInput(heartAllowed, onOpenHeart, onRequestHeart) {
+                                    detectTapGestures(onTap = {
+                                        if (heartAllowed) onOpenHeart() else onRequestHeart()
+                                    })
+                                }
+                            },
+                        )
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                    style = textStyle(
+                        size = 16f,
+                        color = heartColor,
+                        weight = FontWeight.Bold,
+                        letterSpacing = 0.02.em,
+                        tight = false,
+                    ),
+                )
+                BasicText(
+                    text = placeLabel(sample, mode),
+                    modifier = Modifier.padding(top = 1.dp),
+                    maxLines = 1,
+                    softWrap = false,
+                    style = textStyle(
+                        size = 9f,
+                        color = Muted,
+                        weight = FontWeight.Normal,
+                        letterSpacing = 0.04.em,
+                        tight = false,
+                    ),
+                )
+                val fastest = speedPeak
+                val fastestKmh = fastest?.speedKmh
+                if (!isAmbient && fastest != null && fastestKmh != null) {
+                    val atPeak = fastest.bpm?.let { "$it bpm" } ?: "no pulse"
+                    BasicText(
+                        text = "$fastestKmh km/h · $atPeak",
+                        modifier = Modifier
+                            .padding(top = 1.dp)
+                            .pointerInput(onOpenHeart) {
+                                detectTapGestures(onTap = { onOpenHeart() })
+                            }
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                        maxLines = 1,
+                        softWrap = false,
+                        style = textStyle(
+                            size = 9f,
+                            color = AccelCool,
+                            weight = FontWeight.Normal,
+                            letterSpacing = 0.02.em,
+                            tight = false,
+                        ),
+                    )
+                }
+            }
+            BoxWithConstraints(
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = maxHeight * 0.13f)
-                    .then(drift),
-                maxLines = 1,
-                softWrap = false,
-                style = textStyle(
-                    size = if (modeAnnouncement != null) 13f else 12f,
-                    color = if (modeAnnouncement != null && !isAmbient) LiveUnit else Muted,
-                    weight = FontWeight.Medium,
-                    letterSpacing = if (modeAnnouncement != null) 0.06.em else 0.02.em,
-                ),
-            )
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .pointerInput(switchMode) {
+                        detectTapGestures(
+                            onDoubleTap = { numberOnly = true },
+                            onLongPress = { switchMode() },
+                        )
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                val speedSize = maxHeight.value * when (speedText.length) {
+                    1, 2 -> 0.78f
+                    3 -> 0.64f
+                    else -> 0.52f
+                }
+                BasicText(
+                    text = speedText,
+                    maxLines = 1,
+                    softWrap = false,
+                    style = textStyle(
+                        size = speedSize,
+                        color = numberColor,
+                        weight = FontWeight.Bold,
+                        letterSpacing = (-0.04).em,
+                    ).copy(lineHeight = (speedSize * 1.12f).sp),
+                )
+            }
+            Box(
+                modifier = Modifier.height(22.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (!isAmbient) {
+                    BasicText(
+                        text = statusText(sample, ageMs, stale, waiting, weak),
+                        maxLines = 1,
+                        softWrap = false,
+                        style = textStyle(
+                            size = 11f,
+                            color = Muted,
+                            weight = FontWeight.Medium,
+                            letterSpacing = 0.02.em,
+                            tight = false,
+                        ),
+                    )
+                }
+            }
         }
     }
 }
@@ -274,29 +385,31 @@ private fun clockText(): String {
     }
 }
 
+private fun placeLabel(sample: SpeedSample, mode: LocationMode): String {
+    return when {
+        sample.sourceLabel == "Phone" -> "Phone"
+        mode == LocationMode.BOTH -> "Watch + phone"
+        else -> "Watch only"
+    }
+}
+
 private fun statusText(
     sample: SpeedSample,
-    mode: LocationMode,
     ageMs: Long,
     stale: Boolean,
     waiting: Boolean,
     weak: Boolean,
 ): String {
-    val source = when {
-        sample.sourceLabel == "Phone" -> "Phone"
-        mode == LocationMode.BOTH -> "Both"
-        else -> "Watch"
-    }
-    if (!sample.hasFix || ageMs < 0L) return "Searching  ·  $source"
-    if (stale) return "No signal  ·  $source"
+    if (!sample.hasFix || ageMs < 0L) return "Searching"
+    if (stale) return "No signal"
     val age = SpeedFormat.age(ageMs)
-    if (waiting) return "$source  ·  $age"
+    if (waiting) return age
     if (weak) {
         val meters = sample.accuracyMeters?.toInt() ?: 0
-        return "$source  ·  ${meters}m  ·  $age"
+        return "${meters}m  ·  $age"
     }
     val sats = if (sample.satellitesUsed > 0) "${sample.satellitesUsed} sats  ·  " else ""
-    return "$source  ·  $sats$age"
+    return "$sats$age"
 }
 
 private const val SWITCH_HAPTIC_MS = 80L
@@ -324,13 +437,14 @@ private fun textStyle(
     color: Color,
     weight: FontWeight,
     letterSpacing: TextUnit = 0.em,
+    tight: Boolean = true,
 ): TextStyle {
     return TextStyle(
         color = color,
         fontSize = size.sp,
         fontWeight = weight,
         letterSpacing = letterSpacing,
-        lineHeight = size.sp,
+        lineHeight = if (tight) size.sp else (size * 1.35f).sp,
         fontFeatureSettings = "tnum",
         textAlign = TextAlign.Center,
         platformStyle = PlatformTextStyle(includeFontPadding = false),

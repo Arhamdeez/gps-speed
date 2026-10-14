@@ -22,6 +22,8 @@ class MainActivity : ComponentActivity() {
     private val lowBitAmbient = mutableStateOf(false)
     private val ambientTick = mutableIntStateOf(0)
     private val hasPermission = mutableStateOf(false)
+    private val heartAllowed = mutableStateOf(false)
+    private val showHeartHistory = mutableStateOf(false)
 
     private val alarmManager by lazy { getSystemService(AlarmManager::class.java) }
 
@@ -66,6 +68,10 @@ class MainActivity : ComponentActivity() {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val askedBefore = prefs.getBoolean(KEY_ASKED, false)
         prefs.edit().putBoolean(KEY_ASKED, true).apply()
+        if (result.containsKey(HeartRateAccess.permission())) {
+            prefs.edit().putBoolean(KEY_HEART_ASKED, true).apply()
+        }
+        heartAllowed.value = heartGranted()
         if (granted) {
             startSpeedService()
         } else if (
@@ -76,24 +82,46 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val heartPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_HEART_ASKED, true).apply()
+        heartAllowed.value = granted
+        if (granted) startSpeedService(SpeedService.ACTION_HEART)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         lifecycle.addObserver(AmbientLifecycleObserver(this, ambientCallback))
         SpeedHub.mode.value = savedLocationMode()
         hasPermission.value = locationGranted()
+        heartAllowed.value = heartGranted()
         if (hasPermission.value) startSpeedService()
 
         setContent {
-            SpeedScreen(
-                isAmbient = isAmbient.value,
-                burnInProtection = burnInProtection.value,
-                lowBitAmbient = lowBitAmbient.value,
-                ambientTick = ambientTick.intValue,
-                hasPermission = hasPermission.value,
-                onRequestPermission = ::requestLocationPermission,
-                onOpenLocationSettings = ::openLocationSettings,
-                onCycleLocationMode = ::cycleLocationMode,
-            )
+            if (showHeartHistory.value) {
+                RideScreen(
+                    isAmbient = isAmbient.value,
+                    burnInProtection = burnInProtection.value,
+                    lowBitAmbient = lowBitAmbient.value,
+                    ambientTick = ambientTick.intValue,
+                    onBack = { showHeartHistory.value = false },
+                )
+            } else {
+                SpeedScreen(
+                    isAmbient = isAmbient.value,
+                    burnInProtection = burnInProtection.value,
+                    lowBitAmbient = lowBitAmbient.value,
+                    ambientTick = ambientTick.intValue,
+                    hasPermission = hasPermission.value,
+                    onRequestPermission = ::requestLocationPermission,
+                    onOpenLocationSettings = ::openLocationSettings,
+                    onCycleLocationMode = ::cycleLocationMode,
+                    heartAllowed = heartAllowed.value,
+                    onOpenHeart = { showHeartHistory.value = true },
+                    onRequestHeart = { requestHeartPermission(fromUser = true) },
+                )
+            }
         }
     }
 
@@ -101,6 +129,7 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         if (locationGranted()) {
             hasPermission.value = true
+            heartAllowed.value = heartGranted()
             startSpeedService()
         }
     }
@@ -126,12 +155,32 @@ class MainActivity : ComponentActivity() {
         val permissions = buildList {
             add(Manifest.permission.ACCESS_FINE_LOCATION)
             add(Manifest.permission.ACCESS_COARSE_LOCATION)
+            add(HeartRateAccess.permission())
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
         permissionLauncher.launch(permissions.toTypedArray())
     }
+
+    private fun requestHeartPermission(fromUser: Boolean) {
+        if (heartGranted()) {
+            heartAllowed.value = true
+            startSpeedService(SpeedService.ACTION_HEART)
+            return
+        }
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val asked = prefs.getBoolean(KEY_HEART_ASKED, false)
+        val rationale = shouldShowRequestPermissionRationale(HeartRateAccess.permission())
+        if (fromUser && asked && !rationale) {
+            openAppSettings()
+            return
+        }
+        if (!fromUser && asked) return
+        heartPermissionLauncher.launch(HeartRateAccess.permission())
+    }
+
+    private fun heartGranted(): Boolean = HeartRateAccess.granted(this)
 
     private fun locationGranted(): Boolean {
         return ContextCompat.checkSelfPermission(
@@ -224,6 +273,7 @@ class MainActivity : ComponentActivity() {
         const val AMBIENT_REFRESH_MS = 1_000L
         const val PREFS = "speed"
         const val KEY_ASKED = "asked_location"
+        const val KEY_HEART_ASKED = "asked_heart"
         const val KEY_MODE = "location_mode"
     }
 }

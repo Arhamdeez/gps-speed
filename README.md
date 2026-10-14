@@ -11,8 +11,17 @@ The app is standalone. It does not need a phone, though it can use the phone's G
 - **Red** digits while braking, **cyan** while accelerating, and white while the speed is steady. Small GPS jitter does not change the color.
 - Amber digits when the position fix is weak.
 - `--` while GPS is still searching, or after the fix has gone stale.
+- A small **bpm** reading under the speed. Tap it to open the ride graph.
 
 Speeds under about 5 km/h read as 0, so a stopped watch does not flicker.
+
+## Heart rate
+
+The watch reads your pulse while the speed screen is open and saves it with the speed, about once a second. A gap of a few minutes starts a new ride. The log stays on the watch.
+
+Tap the bpm number to open the graph. Heart rate is the rose line, speed is the cyan line, and the marked point is your highest pulse in that ride, with the speed at that moment. **Older** and **Newer** step through saved rides. **Back** returns to the speedometer.
+
+Allow heart rate when the watch asks, or tap **Allow HR** on the speed screen. On Wear OS 6 that is the heart-rate permission. The speedometer still works if you skip it.
 
 ## Controls
 
@@ -50,4 +59,4 @@ Android Studio can deploy the `app` run configuration to the watch directly.
 ./gradlew test
 ```
 
-The unit tests cover speed formatting, spike rejection, and the braking / acceleration color signal.
+The unit tests cover speed formatting, spike rejection, the braking / acceleration color signal, and the heart-rate peak linked to speed.

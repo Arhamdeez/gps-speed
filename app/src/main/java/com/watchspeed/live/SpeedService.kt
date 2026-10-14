@@ -10,6 +10,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.location.GnssStatus
 import android.location.LocationListener
 import android.location.LocationManager
@@ -31,6 +35,7 @@ import com.google.android.gms.location.Priority
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
 
 /**
  * Keeps the watch GPS chip running while the speed screen is open, including
@@ -39,10 +44,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 class SpeedService : Service() {
     private lateinit var locationManager: LocationManager
     private lateinit var notificationManager: NotificationManager
+    private lateinit var sensorManager: SensorManager
     private lateinit var gpsExecutor: ExecutorService
 
     private val tracking = AtomicBoolean(false)
     private val phoneStarted = AtomicBoolean(false)
+    private val heartStarted = AtomicBoolean(false)
+    private val recording = AtomicBoolean(false)
     private val receiverRegistered = AtomicBoolean(false)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastNotifyElapsed = 0L
@@ -79,6 +87,25 @@ class SpeedService : Service() {
         }
     }
 
+    private val heartListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            if (event.sensor.type != Sensor.TYPE_HEART_RATE) return
+            if (event.accuracy == SensorManager.SENSOR_STATUS_NO_CONTACT) return
+            val bpm = event.values.firstOrNull()?.roundToInt() ?: return
+            HeartHub.publish(bpm, SystemClock.elapsedRealtime())
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
+
+    private val recordTick = object : Runnable {
+        override fun run() {
+            if (!recording.get()) return
+            captureRideSample()
+            mainHandler.postDelayed(this, RECORD_INTERVAL_MS)
+        }
+    }
+
     private val providerReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent?) {
             refreshTracking()
@@ -91,6 +118,7 @@ class SpeedService : Service() {
         super.onCreate()
         locationManager = getSystemService(LocationManager::class.java)
         notificationManager = getSystemService(NotificationManager::class.java)
+        sensorManager = getSystemService(SensorManager::class.java)
         gpsExecutor = Executors.newSingleThreadExecutor()
         createChannel()
     }
@@ -100,6 +128,8 @@ class SpeedService : Service() {
         registerProviderReceiver()
         refreshTracking()
         applyLocationMode()
+        startHeartMonitoring()
+        startRecording()
         touchWakeLock()
         return START_NOT_STICKY
     }
@@ -107,6 +137,8 @@ class SpeedService : Service() {
     override fun onDestroy() {
         tracking.set(false)
         stopUpdates()
+        stopHeartMonitoring()
+        stopRecording()
         unregisterProviderReceiver()
         gpsExecutor.shutdownNow()
         if (wakeLock.isHeld) wakeLock.release()
@@ -217,6 +249,66 @@ class SpeedService : Service() {
         stopPhoneUpdates()
     }
 
+    private fun startHeartMonitoring() {
+        if (!HeartRateAccess.granted(this)) return
+        if (!heartStarted.compareAndSet(false, true)) return
+        val sensor = sensorManager.getDefaultSensor(Sensor.TYPE_HEART_RATE)
+        if (sensor == null) {
+            heartStarted.set(false)
+            return
+        }
+        try {
+            val registered = sensorManager.registerListener(
+                heartListener,
+                sensor,
+                SensorManager.SENSOR_DELAY_NORMAL,
+                mainHandler,
+            )
+            if (!registered) heartStarted.set(false)
+        } catch (_: SecurityException) {
+            heartStarted.set(false)
+        }
+    }
+
+    private fun stopHeartMonitoring() {
+        if (!heartStarted.compareAndSet(true, false)) return
+        sensorManager.unregisterListener(heartListener)
+    }
+
+    private fun startRecording() {
+        if (!recording.compareAndSet(false, true)) return
+        mainHandler.post(recordTick)
+    }
+
+    private fun stopRecording() {
+        recording.set(false)
+        mainHandler.removeCallbacks(recordTick)
+    }
+
+    private fun captureRideSample() {
+        val sample = SpeedHub.sample.value
+        val ageMs = if (sample.elapsedRealtimeNanos == 0L) {
+            Long.MAX_VALUE
+        } else {
+            (SystemClock.elapsedRealtimeNanos() - sample.elapsedRealtimeNanos) / 1_000_000L
+        }
+        val speedFresh = sample.hasFix && ageMs in 0L..8_000L
+        val speedKmh = if (speedFresh) {
+            SpeedFormat.kilometersPerHour(sample.metersPerSecond)
+        } else {
+            null
+        }
+        val bpm = HeartHub.reading.value.freshBpm(SystemClock.elapsedRealtime())
+        val moving = (speedKmh ?: 0) > 0
+        if (!moving && bpm == null) return
+        RideStore.record(
+            context = applicationContext,
+            timeMillis = System.currentTimeMillis(),
+            speedKmh = speedKmh,
+            bpm = bpm,
+        )
+    }
+
     private fun touchWakeLock() {
         val now = SystemClock.elapsedRealtime()
         if (now - lastWakeElapsed < WAKE_RENEW_MS && wakeLock.isHeld) return
@@ -275,12 +367,32 @@ class SpeedService : Service() {
     }
 
     private fun startAsForeground(text: String) {
-        ServiceCompat.startForeground(
-            this,
-            NOTIFICATION_ID,
-            buildNotification(text),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
-        )
+        try {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                buildNotification(text),
+                foregroundType(),
+            )
+        } catch (_: SecurityException) {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                buildNotification(text),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
+            )
+        }
+    }
+
+    private fun foregroundType(): Int {
+        var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+            HeartRateAccess.granted(this)
+        ) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH
+        }
+        return type
     }
 
     private fun createChannel() {
@@ -332,11 +444,13 @@ class SpeedService : Service() {
 
     companion object {
         const val ACTION_APPLY_MODE = "com.watchspeed.live.APPLY_MODE"
+        const val ACTION_HEART = "com.watchspeed.live.HEART"
         private const val CHANNEL_ID = "live_speed"
         const val NOTIFICATION_ID = 42
         const val GPS_INTERVAL_MS = 200L
         const val GPS_MIN_INTERVAL_MS = 100L
         const val NOTIFY_INTERVAL_MS = 1_000L
+        const val RECORD_INTERVAL_MS = 1_000L
         const val WAKE_HOLD_MS = 60L * 60L * 1_000L
         const val WAKE_RENEW_MS = 10L * 60L * 1_000L
     }

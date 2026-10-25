@@ -19,15 +19,6 @@ fun LocationMode.title(): String = when (this) {
     LocationMode.BOTH -> "Watch + phone"
 }
 
-/** Phone fixes are used only while watch GPS has gone quiet, so the two cannot flicker. */
-internal fun shouldUsePhoneFix(mode: LocationMode, watchAgeNanos: Long?): Boolean {
-    if (mode != LocationMode.BOTH) return false
-    val age = watchAgeNanos ?: return true
-    return age > PHONE_AFTER_WATCH_NANOS
-}
-
-private const val PHONE_AFTER_WATCH_NANOS = 2_500_000_000L
-
 data class SpeedSample(
     val metersPerSecond: Float? = null,
     val accuracyMeters: Float? = null,
@@ -47,10 +38,23 @@ object SpeedHub {
     val gpsEnabled = MutableStateFlow(true)
     val mode = MutableStateFlow(LocationMode.WATCH)
 
+    /** True only while the speed screen is on the watch. Leaving the app clears it. */
+    @Volatile
+    var sessionOpen: Boolean = false
+
     private val filter = SpeedFilter()
     private val trendTracker = SpeedTrendTracker()
     private var satellites = 0
-    private var lastWatchSpeedRealtimeNanos = 0L
+    private var watchLocation: Location? = null
+    private var phoneLocation: Location? = null
+    private var shownSource: FixSource? = null
+
+    @Synchronized
+    fun setMode(next: LocationMode) {
+        if (mode.value == next) return
+        mode.value = next
+        republish(resetFilter = true)
+    }
 
     @Synchronized
     fun setGpsEnabled(enabled: Boolean) {
@@ -59,7 +63,9 @@ object SpeedHub {
             filter.reset()
             trendTracker.reset()
             satellites = 0
-            lastWatchSpeedRealtimeNanos = 0L
+            watchLocation = null
+            phoneLocation = null
+            shownSource = null
             sample.value = SpeedSample()
         }
     }
@@ -72,18 +78,59 @@ object SpeedHub {
 
     @Synchronized
     fun publish(location: Location, source: FixSource) {
-        val watchAge = if (lastWatchSpeedRealtimeNanos == 0L) {
-            null
-        } else {
-            SystemClock.elapsedRealtimeNanos() - lastWatchSpeedRealtimeNanos
-        }
-        if (source == FixSource.PHONE && !shouldUsePhoneFix(mode.value, watchAge)) return
+        val copy = Location(location)
+        if (source == FixSource.WATCH) watchLocation = copy else phoneLocation = copy
+        if (source == FixSource.PHONE && mode.value != LocationMode.BOTH) return
+        val before = shownSource
+        val chosen = choose(holding = before) ?: return
+        if (chosen == before && source != chosen) return
+        republish(resetFilter = false)
+    }
 
-        val hasDopplerSpeed = location.hasSpeed() && !location.speed.isNaN()
-        if (source == FixSource.WATCH && hasDopplerSpeed) {
-            lastWatchSpeedRealtimeNanos = location.elapsedRealtimeNanos
+    @Synchronized
+    private fun republish(resetFilter: Boolean) {
+        val chosen = choose(holding = if (resetFilter) null else shownSource)
+        if (chosen == null) {
+            shownSource = null
+            if (resetFilter) {
+                filter.reset()
+                trendTracker.reset()
+            }
+            sample.value = SpeedSample(satellitesUsed = satellites)
+            return
         }
-        val speed = if (hasDopplerSpeed) location.speed else null
+        if (resetFilter || chosen != shownSource) {
+            filter.reset()
+            trendTracker.reset()
+        }
+        shownSource = chosen
+        val location = if (chosen == FixSource.PHONE) phoneLocation else watchLocation
+        if (location != null) emit(location, chosen)
+    }
+
+    private fun choose(holding: FixSource?): FixSource? {
+        val now = SystemClock.elapsedRealtimeNanos()
+        return preferredSource(
+            mode = mode.value,
+            holding = holding,
+            watch = watchLocation?.let { offer(it, now) },
+            phone = phoneLocation?.let { offer(it, now) },
+        )
+    }
+
+    private fun offer(location: Location, nowNanos: Long): SourceOffer {
+        val age = (nowNanos - location.elapsedRealtimeNanos).coerceAtLeast(0L)
+        val speed = if (location.hasSpeed() && location.speed.isFinite() && location.speed >= 0f) {
+            location.speed
+        } else {
+            null
+        }
+        return SourceOffer(ageNanos = age, speedMps = speed)
+    }
+
+    private fun emit(location: Location, source: FixSource) {
+        val hasDopplerSpeed = location.hasSpeed() && location.speed.isFinite()
+        val speed = if (hasDopplerSpeed && location.speed >= 0f) location.speed else null
         val speedAccuracy = if (location.hasSpeedAccuracy()) {
             location.speedAccuracyMetersPerSecond
         } else {

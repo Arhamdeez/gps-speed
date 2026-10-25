@@ -27,11 +27,13 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.wear.ongoing.OngoingActivity
 import androidx.wear.ongoing.Status
+import com.google.android.gms.location.LocationAvailability
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import com.google.android.gms.wearable.Wearable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -46,15 +48,37 @@ class SpeedService : Service() {
     private lateinit var notificationManager: NotificationManager
     private lateinit var sensorManager: SensorManager
     private lateinit var gpsExecutor: ExecutorService
+    private lateinit var recordExecutor: ExecutorService
 
     private val tracking = AtomicBoolean(false)
     private val phoneStarted = AtomicBoolean(false)
+    private var phoneConnected = false
+    private var phoneLocationOn = false
+    private var phoneFixSeen = false
+    private var phoneOffArmed = false
     private val heartStarted = AtomicBoolean(false)
     private val recording = AtomicBoolean(false)
     private val receiverRegistered = AtomicBoolean(false)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastNotifyElapsed = 0L
     private var lastWakeElapsed = 0L
+
+    /**
+     * A package restart during install removes the GPS listener while this
+     * service still believes it is registered. Ask again once that settles,
+     * unless a fresh fix is already arriving.
+     */
+    private val rearmGps = Runnable {
+        if (!tracking.get() || !gpsProviderEnabled()) return@Runnable
+        val sample = SpeedHub.sample.value
+        val ageMs = if (sample.elapsedRealtimeNanos == 0L) {
+            Long.MAX_VALUE
+        } else {
+            (SystemClock.elapsedRealtimeNanos() - sample.elapsedRealtimeNanos) / 1_000_000L
+        }
+        if (sample.hasFix && ageMs in 0L..8_000L) return@Runnable
+        startUpdates(force = true)
+    }
 
     private val wakeLock by lazy {
         (getSystemService(POWER_SERVICE) as PowerManager)
@@ -71,9 +95,45 @@ class SpeedService : Service() {
     private val phoneCallback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
             val location = result.lastLocation ?: return
+            phoneFixSeen = true
+            phoneOffArmed = false
+            mainHandler.removeCallbacks(markPhoneLocationOff)
+            if (!phoneLocationOn) {
+                phoneLocationOn = true
+                applyPhoneMode()
+            }
             SpeedHub.publish(location, FixSource.PHONE)
             touchWakeLock()
             maybeNotify()
+        }
+
+        override fun onLocationAvailability(availability: LocationAvailability) {
+            if (!phoneConnected) return
+            if (availability.isLocationAvailable) {
+                phoneLocationOn = true
+                phoneOffArmed = false
+                mainHandler.removeCallbacks(markPhoneLocationOff)
+                applyPhoneMode()
+                return
+            }
+            phoneFixSeen = false
+            if (phoneOffArmed) return
+            phoneOffArmed = true
+            mainHandler.postDelayed(markPhoneLocationOff, PHONE_LOCATION_GRACE_MS)
+        }
+    }
+
+    private val markPhoneLocationOff = Runnable {
+        phoneOffArmed = false
+        if (!phoneConnected || phoneFixSeen) return@Runnable
+        phoneLocationOn = false
+        applyPhoneMode()
+    }
+
+    private val pollPhone: Runnable = object : Runnable {
+        override fun run() {
+            refreshPhoneConnection()
+            mainHandler.postDelayed(this, PHONE_POLL_MS)
         }
     }
 
@@ -120,30 +180,48 @@ class SpeedService : Service() {
         notificationManager = getSystemService(NotificationManager::class.java)
         sensorManager = getSystemService(SensorManager::class.java)
         gpsExecutor = Executors.newSingleThreadExecutor()
+        recordExecutor = Executors.newSingleThreadExecutor()
         createChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startAsForeground("Searching GPS")
+        if (!SpeedHub.sessionOpen) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         registerProviderReceiver()
         refreshTracking()
         applyLocationMode()
         startHeartMonitoring()
         startRecording()
+        watchPhoneConnection()
         touchWakeLock()
+        mainHandler.removeCallbacks(rearmGps)
+        mainHandler.postDelayed(rearmGps, REARM_DELAY_MS)
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         tracking.set(false)
+        mainHandler.removeCallbacks(rearmGps)
+        mainHandler.removeCallbacks(markPhoneLocationOff)
+        mainHandler.removeCallbacks(pollPhone)
         stopUpdates()
         stopHeartMonitoring()
         stopRecording()
         unregisterProviderReceiver()
         gpsExecutor.shutdownNow()
+        recordExecutor.shutdownNow()
         if (wakeLock.isHeld) wakeLock.release()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         super.onDestroy()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        SpeedHub.sessionOpen = false
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun refreshTracking() {
@@ -164,8 +242,17 @@ class SpeedService : Service() {
     }
 
     @SuppressLint("MissingPermission")
-    private fun startUpdates() {
-        if (!tracking.compareAndSet(false, true)) return
+    private fun startUpdates(force: Boolean = false) {
+        if (!force && !tracking.compareAndSet(false, true)) return
+        tracking.set(true)
+        try {
+            locationManager.removeUpdates(gpsListener)
+        } catch (_: Exception) {
+        }
+        try {
+            locationManager.unregisterGnssStatusCallback(gnssCallback)
+        } catch (_: Exception) {
+        }
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 val request = android.location.LocationRequest.Builder(GPS_INTERVAL_MS)
@@ -191,6 +278,7 @@ class SpeedService : Service() {
             }
         } catch (_: Exception) {
             tracking.set(false)
+            return
         }
         try {
             locationManager.registerGnssStatusCallback(gpsExecutor, gnssCallback)
@@ -199,13 +287,55 @@ class SpeedService : Service() {
         }
     }
 
-    @SuppressLint("MissingPermission")
     private fun applyLocationMode() {
-        if (SpeedHub.mode.value == LocationMode.BOTH) {
-            startPhoneUpdates()
-        } else {
-            stopPhoneUpdates()
+        applyPhoneMode()
+    }
+
+    private fun watchPhoneConnection() {
+        mainHandler.removeCallbacks(pollPhone)
+        mainHandler.post(pollPhone)
+    }
+
+    private fun refreshPhoneConnection() {
+        try {
+            Wearable.getNodeClient(this).connectedNodes
+                .addOnSuccessListener { nodes ->
+                    mainHandler.post { onPhoneConnection(nodes.any { it.isNearby }) }
+                }
+                .addOnFailureListener {
+                    mainHandler.post { onPhoneConnection(false) }
+                }
+        } catch (_: Exception) {
+            onPhoneConnection(false)
         }
+    }
+
+    private fun onPhoneConnection(connected: Boolean) {
+        val changed = phoneConnected != connected
+        phoneConnected = connected
+        if (!connected) {
+            phoneLocationOn = false
+            phoneFixSeen = false
+            phoneOffArmed = false
+            mainHandler.removeCallbacks(markPhoneLocationOff)
+            stopPhoneUpdates()
+            applyPhoneMode()
+            return
+        }
+        if (changed) {
+            phoneLocationOn = true
+            phoneFixSeen = false
+            phoneOffArmed = false
+            mainHandler.removeCallbacks(markPhoneLocationOff)
+        }
+        startPhoneUpdates()
+        applyPhoneMode()
+    }
+
+    private fun applyPhoneMode() {
+        if (phoneConnected) startPhoneUpdates() else stopPhoneUpdates()
+        SpeedHub.setMode(locationMode(phoneConnected, phoneLocationOn))
+        maybeNotify(force = true)
     }
 
     @SuppressLint("MissingPermission")
@@ -301,12 +431,17 @@ class SpeedService : Service() {
         val bpm = HeartHub.reading.value.freshBpm(SystemClock.elapsedRealtime())
         val moving = (speedKmh ?: 0) > 0
         if (!moving && bpm == null) return
-        RideStore.record(
-            context = applicationContext,
-            timeMillis = System.currentTimeMillis(),
-            speedKmh = speedKmh,
-            bpm = bpm,
-        )
+        val timeMillis = System.currentTimeMillis()
+        val appContext = applicationContext
+        recordExecutor.execute {
+            if (!recording.get()) return@execute
+            RideStore.record(
+                context = appContext,
+                timeMillis = timeMillis,
+                speedKmh = speedKmh,
+                bpm = bpm,
+            )
+        }
     }
 
     private fun touchWakeLock() {
@@ -453,5 +588,8 @@ class SpeedService : Service() {
         const val RECORD_INTERVAL_MS = 1_000L
         const val WAKE_HOLD_MS = 60L * 60L * 1_000L
         const val WAKE_RENEW_MS = 10L * 60L * 1_000L
+        const val REARM_DELAY_MS = 8_000L
+        const val PHONE_LOCATION_GRACE_MS = 15_000L
+        const val PHONE_POLL_MS = 3_000L
     }
 }

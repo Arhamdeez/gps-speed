@@ -1,11 +1,6 @@
 package com.watchspeed.live
 
-import android.content.Context
-import android.os.Build
 import android.os.SystemClock
-import android.os.VibrationAttributes
-import android.os.VibrationEffect
-import android.os.Vibrator
 import android.text.format.DateFormat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -66,7 +61,6 @@ fun SpeedScreen(
     hasPermission: Boolean,
     onRequestPermission: () -> Unit,
     onOpenLocationSettings: () -> Unit,
-    onCycleLocationMode: () -> Unit,
     heartAllowed: Boolean,
     onOpenHeart: () -> Unit,
     onRequestHeart: () -> Unit,
@@ -77,15 +71,6 @@ fun SpeedScreen(
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) { RideStore.warm(context) }
     }
-    val switchMode = remember(context, onCycleLocationMode) {
-        {
-            strongSwitchHaptic(context)
-            onCycleLocationMode()
-        }
-    }
-    val holdToSwitch = Modifier.pointerInput(switchMode) {
-        detectTapGestures(onLongPress = { switchMode() })
-    }
 
     if (!hasPermission) {
         PromptScreen(
@@ -93,7 +78,6 @@ fun SpeedScreen(
             action = "Tap to allow location",
             note = mode.title(),
             onClick = onRequestPermission,
-            onHold = switchMode,
         )
         return
     }
@@ -105,7 +89,6 @@ fun SpeedScreen(
             action = "Tap to turn on GPS",
             note = mode.title(),
             onClick = onOpenLocationSettings,
-            onHold = switchMode,
         )
         return
     }
@@ -173,11 +156,8 @@ fun SpeedScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .offset(x = shiftX.dp, y = shiftY.dp)
-                    .pointerInput(switchMode) {
-                        detectTapGestures(
-                            onDoubleTap = { numberOnly = false },
-                            onLongPress = { switchMode() },
-                        )
+                    .pointerInput(Unit) {
+                        detectTapGestures(onDoubleTap = { numberOnly = false })
                     },
                 contentAlignment = Alignment.Center,
             ) {
@@ -206,8 +186,7 @@ fun SpeedScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(top = boardHeight * 0.12f, bottom = boardHeight * 0.16f)
-                .offset(x = shiftX.dp, y = shiftY.dp)
-                .then(holdToSwitch),
+                .offset(x = shiftX.dp, y = shiftY.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -245,7 +224,7 @@ fun SpeedScreen(
                     ),
                 )
                 BasicText(
-                    text = placeLabel(sample, mode),
+                    text = placeLabel(mode),
                     modifier = Modifier.padding(top = 1.dp),
                     maxLines = 1,
                     softWrap = false,
@@ -285,11 +264,8 @@ fun SpeedScreen(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .pointerInput(switchMode) {
-                        detectTapGestures(
-                            onDoubleTap = { numberOnly = true },
-                            onLongPress = { switchMode() },
-                        )
+                    .pointerInput(Unit) {
+                        detectTapGestures(onDoubleTap = { numberOnly = true })
                     },
                 contentAlignment = Alignment.Center,
             ) {
@@ -339,17 +315,13 @@ private fun PromptScreen(
     action: String,
     note: String?,
     onClick: () -> Unit,
-    onHold: () -> Unit,
 ) {
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(ScreenBlack)
-            .pointerInput(onClick, onHold) {
-                detectTapGestures(
-                    onTap = { onClick() },
-                    onLongPress = { onHold() },
-                )
+            .pointerInput(onClick) {
+                detectTapGestures(onTap = { onClick() })
             },
         contentAlignment = Alignment.Center,
     ) {
@@ -385,12 +357,8 @@ private fun clockText(): String {
     }
 }
 
-private fun placeLabel(sample: SpeedSample, mode: LocationMode): String {
-    return when {
-        sample.sourceLabel == "Phone" -> "Phone"
-        mode == LocationMode.BOTH -> "Watch + phone"
-        else -> "Watch only"
-    }
+private fun placeLabel(mode: LocationMode): String {
+    return if (mode == LocationMode.BOTH) "Watch + phone" else "Watch only"
 }
 
 private fun statusText(
@@ -410,26 +378,6 @@ private fun statusText(
     }
     val sats = if (sample.satellitesUsed > 0) "${sample.satellitesUsed} sats  ·  " else ""
     return "$sats$age"
-}
-
-private const val SWITCH_HAPTIC_MS = 80L
-private const val SWITCH_HAPTIC_AMPLITUDE = 255
-
-private fun strongSwitchHaptic(context: Context) {
-    val vibrator = context.getSystemService(Vibrator::class.java) ?: return
-    if (!vibrator.hasVibrator()) return
-    val effect = VibrationEffect.createOneShot(SWITCH_HAPTIC_MS, SWITCH_HAPTIC_AMPLITUDE)
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        vibrator.vibrate(
-            effect,
-            VibrationAttributes.Builder()
-                .setUsage(VibrationAttributes.USAGE_TOUCH)
-                .build(),
-        )
-    } else {
-        @Suppress("DEPRECATION")
-        vibrator.vibrate(effect)
-    }
 }
 
 private fun textStyle(

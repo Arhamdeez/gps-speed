@@ -49,7 +49,7 @@ class SpeedFilter {
         val accepted = accept(timeMillis, speed) ?: return output
         lastAccepted = accepted
         lastAdmitMs = timeMillis
-        output = clampStill(timeMillis, accepted, speedAccuracyMps)
+        output = clampStill(timeMillis, accepted)
         return output
     }
 
@@ -90,13 +90,13 @@ class SpeedFilter {
     }
 
     /**
-     * A still watch reports Doppler noise as random km/h. One spike, however
-     * high, stays at zero. Speed has to hold above the noise, and sit outside
-     * its own error bar, before it is shown. Once it does, each new fix shows
-     * at once, and one low sample does not snap the reading back to zero.
+     * A still watch reports Doppler noise as random km/h. One spike stays at
+     * zero. Walking or riding has to hold for a moment, and a wide error bar
+     * does not hide that speed. Once you are moving, each new fix shows at
+     * once, and one low sample does not snap the reading back to zero.
      */
-    private fun clampStill(timeMillis: Long, speed: Float, accuracy: Float?): Float {
-        val aboveNoise = speed >= STILL_EXIT_MPS && (accuracy == null || speed > accuracy)
+    private fun clampStill(timeMillis: Long, speed: Float): Float {
+        val aboveNoise = speed >= STILL_EXIT_MPS
         if (holdingZero) {
             stoppedSinceMs = Long.MIN_VALUE
             if (speed >= FAST_EXIT_MPS && aboveNoise) {
@@ -139,11 +139,11 @@ class SpeedFilter {
         const val MAX_ACCEL_MPS2 = 14f
         const val AGREE_MPS = 2.5f
         const val MAX_HORIZONTAL_M = 40f
-        const val MAX_SPEED_ACCURACY_MPS = 10f
+        const val MAX_SPEED_ACCURACY_MPS = 20f
         const val MAX_SPEED_MPS = 120f
-        const val STILL_ENTER_MPS = 1.2f
-        const val STILL_EXIT_MPS = 2.5f
-        const val FAST_EXIT_MPS = 8f
+        const val STILL_ENTER_MPS = 0.8f
+        const val STILL_EXIT_MPS = 1.2f
+        const val FAST_EXIT_MPS = 3.5f
         const val MIN_FAST_MS = 200L
         const val CONFIRM_MS = 1_000L
     }

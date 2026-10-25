@@ -82,6 +82,7 @@ dependencies {
     implementation("androidx.wear:wear:1.4.0")
     implementation("androidx.wear:wear-ongoing:1.1.0")
     implementation("com.google.android.gms:play-services-location:21.3.0")
+    implementation("com.google.android.gms:play-services-wearable:19.0.0")
 
     testImplementation("junit:junit:4.13.2")
 }

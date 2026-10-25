@@ -1,10 +1,8 @@
 package com.watchspeed.live
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SpeedFilterTest {
@@ -120,10 +118,17 @@ class SpeedFilterTest {
     }
 
     @Test
-    fun uncertainSpeedWhileStoppedStaysAtZero() {
+    fun movementShowsEvenWhenTheErrorBarIsWiderThanTheSpeed() {
         val filter = SpeedFilter()
         assertEquals(0f, filter.update(0L, 4.2f, 6f, 25f))
-        assertEquals(0f, filter.update(1_200L, 4.5f, 6f, 25f))
+        assertNear(4.5f, filter.update(1_000L, 4.5f, 6f, 25f))
+    }
+
+    @Test
+    fun walkingShowsAfterItHolds() {
+        val filter = SpeedFilter()
+        assertEquals(0f, filter.update(0L, 1.5f, 0.8f, 12f))
+        assertNear(1.6f, filter.update(1_000L, 1.6f, 0.8f, 12f))
     }
 
     @Test
@@ -189,14 +194,6 @@ class SpeedFilterTest {
     fun noFixYetStaysEmpty() {
         val filter = SpeedFilter()
         assertNull(filter.update(0L, null, null, null))
-    }
-
-    @Test
-    fun phoneIsIgnoredUnlessWatchGpsGoesQuiet() {
-        assertFalse(shouldUsePhoneFix(LocationMode.WATCH, null))
-        assertFalse(shouldUsePhoneFix(LocationMode.BOTH, 500_000_000L))
-        assertTrue(shouldUsePhoneFix(LocationMode.BOTH, null))
-        assertTrue(shouldUsePhoneFix(LocationMode.BOTH, 3_000_000_000L))
     }
 
     private fun assertNear(expected: Float, actual: Float?, delta: Float = 0.05f) {

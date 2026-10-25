@@ -24,6 +24,7 @@ class MainActivity : ComponentActivity() {
     private val hasPermission = mutableStateOf(false)
     private val heartAllowed = mutableStateOf(false)
     private val showHeartHistory = mutableStateOf(false)
+    private var screenVisible = false
 
     private val alarmManager by lazy { getSystemService(AlarmManager::class.java) }
 
@@ -73,7 +74,7 @@ class MainActivity : ComponentActivity() {
         }
         heartAllowed.value = heartGranted()
         if (granted) {
-            startSpeedService()
+            if (screenVisible) startSpeedService()
         } else if (
             askedBefore &&
             !shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_FINE_LOCATION)
@@ -87,16 +88,14 @@ class MainActivity : ComponentActivity() {
     ) { granted ->
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_HEART_ASKED, true).apply()
         heartAllowed.value = granted
-        if (granted) startSpeedService(SpeedService.ACTION_HEART)
+        if (granted && screenVisible) startSpeedService(SpeedService.ACTION_HEART)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         lifecycle.addObserver(AmbientLifecycleObserver(this, ambientCallback))
-        SpeedHub.mode.value = savedLocationMode()
         hasPermission.value = locationGranted()
         heartAllowed.value = heartGranted()
-        if (hasPermission.value) startSpeedService()
 
         setContent {
             if (showHeartHistory.value) {
@@ -116,7 +115,6 @@ class MainActivity : ComponentActivity() {
                     hasPermission = hasPermission.value,
                     onRequestPermission = ::requestLocationPermission,
                     onOpenLocationSettings = ::openLocationSettings,
-                    onCycleLocationMode = ::cycleLocationMode,
                     heartAllowed = heartAllowed.value,
                     onOpenHeart = { showHeartHistory.value = true },
                     onRequestHeart = { requestHeartPermission(fromUser = true) },
@@ -127,6 +125,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (isFinishing) return
+        screenVisible = true
+        if (intent?.action == ACTION_AMBIENT_TICK && !isAmbient.value) {
+            stopSpeedService()
+            finish()
+            return
+        }
         if (locationGranted()) {
             hasPermission.value = true
             heartAllowed.value = heartGranted()
@@ -134,20 +139,28 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStop() {
+        screenVisible = false
+        if (!isChangingConfigurations) stopSpeedService()
+        super.onStop()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.action == ACTION_AMBIENT_TICK && isAmbient.value) {
-            ambientTick.intValue++
-            scheduleAmbientRefresh()
+        if (intent.action != ACTION_AMBIENT_TICK) return
+        if (!isAmbient.value || !screenVisible) {
+            stopSpeedService()
+            finish()
+            return
         }
+        ambientTick.intValue++
+        scheduleAmbientRefresh()
     }
 
     override fun onDestroy() {
         cancelAmbientRefresh()
-        if (isFinishing) {
-            stopService(Intent(this, SpeedService::class.java))
-        }
+        if (isFinishing) stopSpeedService()
         super.onDestroy()
     }
 
@@ -166,7 +179,7 @@ class MainActivity : ComponentActivity() {
     private fun requestHeartPermission(fromUser: Boolean) {
         if (heartGranted()) {
             heartAllowed.value = true
-            startSpeedService(SpeedService.ACTION_HEART)
+            if (screenVisible) startSpeedService(SpeedService.ACTION_HEART)
             return
         }
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -189,25 +202,17 @@ class MainActivity : ComponentActivity() {
         ) == PackageManager.PERMISSION_GRANTED
     }
 
-    private fun cycleLocationMode() {
-        val next = when (SpeedHub.mode.value) {
-            LocationMode.WATCH -> LocationMode.BOTH
-            LocationMode.BOTH -> LocationMode.WATCH
-        }
-        SpeedHub.mode.value = next
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_MODE, next.name).apply()
-        startSpeedService(SpeedService.ACTION_APPLY_MODE)
-    }
-
-    private fun savedLocationMode(): LocationMode {
-        val saved = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_MODE, null)
-        return runCatching { LocationMode.valueOf(saved ?: "") }.getOrDefault(LocationMode.WATCH)
-    }
-
     private fun startSpeedService(action: String? = null) {
+        SpeedHub.sessionOpen = true
         val intent = Intent(this, SpeedService::class.java)
         if (action != null) intent.action = action
         ContextCompat.startForegroundService(this, intent)
+    }
+
+    private fun stopSpeedService() {
+        SpeedHub.sessionOpen = false
+        cancelAmbientRefresh()
+        stopService(Intent(this, SpeedService::class.java))
     }
 
     private fun openLocationSettings() {
@@ -274,6 +279,5 @@ class MainActivity : ComponentActivity() {
         const val PREFS = "speed"
         const val KEY_ASKED = "asked_location"
         const val KEY_HEART_ASKED = "asked_heart"
-        const val KEY_MODE = "location_mode"
     }
 }
